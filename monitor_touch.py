@@ -51,42 +51,45 @@ def main():
     touch_x = None
     touch_y = None
     
-    start_time = time.time()
-    
-    while True:
-        elapsed = time.time() - start_time
-        if elapsed >= timeout:
-            break
-            
-        r, w, x_err = select.select([f], [], [], timeout - elapsed)
-        if not r:
-            break # Timeout
-            
-        data = f.read(event_size)
-        if len(data) < event_size:
-            break
-            
-        _, _, ev_type, ev_code, ev_val = struct.unpack(event_format, data)
+    try:
+        start_time = time.time()
         
-        # EV_ABS (type = 3)
-        if ev_type == 3:
-            if ev_code in [0, 53]: # ABS_X or ABS_MT_POSITION_X
-                x = ev_val
-            elif ev_code in [1, 54]: # ABS_Y or ABS_MT_POSITION_Y
-                y = ev_val
-        # EV_KEY (type = 1) and BTN_TOUCH (code = 330)
-        elif ev_type == 1 and ev_code == 330:
-            if ev_val == 0: # Release
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                break
+                
+            r, w, x_err = select.select([f], [], [], max(0.0, timeout - elapsed))
+            if not r:
+                break # Timeout
+                
+            data = f.read(event_size)
+            if not data or len(data) < event_size:
+                break
+                
+            _, _, ev_type, ev_code, ev_val = struct.unpack(event_format, data)
+            
+            # EV_ABS (type = 3)
+            if ev_type == 3:
+                if ev_code in [0, 53]: # ABS_X or ABS_MT_POSITION_X
+                    x = ev_val
+                elif ev_code in [1, 54]: # ABS_Y or ABS_MT_POSITION_Y
+                    y = ev_val
+            # EV_KEY (type = 1) and BTN_TOUCH (code = 330)
+            elif ev_type == 1 and ev_code == 330:
+                if ev_val == 0: # Release
+                    if x is not None and y is not None:
+                        touch_x = x
+                        touch_y = y
+                        break
+            # EV_SYN (type = 0) as fallback
+            elif ev_type == 0 and ev_code == 0:
                 if x is not None and y is not None:
                     touch_x = x
                     touch_y = y
-                    break
-        # EV_SYN (type = 0) as fallback
-        elif ev_type == 0 and ev_code == 0:
-            if x is not None and y is not None:
-                touch_x = x
-                touch_y = y
-                
+    finally:
+        f.close()
+        
     # Fallback to last coordinates seen if release event was missed
     if touch_x is None or touch_y is None:
         touch_x = x
@@ -105,44 +108,45 @@ def main():
         touch_x = int(touch_x * 758 / 4096)
         touch_y = int(touch_y * 1024 / 4096)
     elif touch_x > 1024 or touch_y > 1024:
-        # Some digitizers report 0-1024 / 0-1280, scale to 758x1024
         touch_x = int(touch_x * 758 / 1024)
         touch_y = int(touch_y * 1024 / 1280)
         
     print("Detected touch: Raw=({0},{1}) Scaled_Portrait=({2},{3}) Orientation={4}".format(orig_x, orig_y, touch_x, touch_y, orientation))
     
-    # Check zones
+    # Check 5 button zones: [Rotate] [Mode] [Light] [Lang] [Exit]
     if orientation == "landscape":
-        # Landscape maps visually to horizontal layout rotated 90 deg clockwise.
-        # Bottom of landscape (Y > 710) maps to LEFT of portrait (X < 80).
-        # Right of landscape (X > 700) maps to BOTTOM of portrait (Y > 700).
-        # Landscape Rotate button was X: 740-810, Y > 710 -> maps to Y: 740-810, X < 120
-        # Landscape Lang button was X: 830-900, Y > 710 -> maps to Y: 830-900, X < 120
-        # Landscape Exit button was X: 920-990, Y > 710 -> maps to Y: 920-990, X < 120
         if touch_x < 120:
-            if 730 < touch_y < 815:
+            if 640 <= touch_y < 715:
                 print("Action: TOGGLE")
                 sys.exit(10)
-            elif 820 < touch_y < 905:
+            elif 715 <= touch_y < 785:
+                print("Action: MODE")
+                sys.exit(12)
+            elif 785 <= touch_y < 855:
+                print("Action: LIGHT")
+                sys.exit(14)
+            elif 855 <= touch_y < 925:
                 print("Action: LANG")
                 sys.exit(15)
-            elif touch_y >= 910:
+            elif touch_y >= 925:
                 print("Action: EXIT")
                 sys.exit(20)
     else:
         # Default Portrait (758x1024)
-        # Bottom status bar is Y > 900
-        if touch_y > 900:
-            # Rotate button is X: 480 to 550
-            # Lang button is X: 570 to 640
-            # Exit button is X: 660 to 730
-            if 460 < touch_x < 555:
+        if touch_y > 950:
+            if 440 <= touch_x < 500:
                 print("Action: TOGGLE")
                 sys.exit(10)
-            elif 560 < touch_x < 645:
+            elif 500 <= touch_x < 560:
+                print("Action: MODE")
+                sys.exit(12)
+            elif 560 <= touch_x < 620:
+                print("Action: LIGHT")
+                sys.exit(14)
+            elif 620 <= touch_x < 680:
                 print("Action: LANG")
                 sys.exit(15)
-            elif touch_x >= 650:
+            elif touch_x >= 680:
                 print("Action: EXIT")
                 sys.exit(20)
                 

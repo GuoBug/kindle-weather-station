@@ -24,14 +24,19 @@ The dashboard includes a touchscreen-controlled status bar with buttons to switc
 
 ## Features
 
+- **Dual Power Modes**:
+  - **Eco Mode (Default)**: Eliminates high-frequency heartbeat waveform refreshes, aligns clock rendering precisely to 1-minute intervals, and syncs weather every 30 minutes (1 hour at night), dramatically extending Kindle battery life.
+  - **Performance Mode**: Keeps the dynamic LCD colon heartbeat animation (visible for 7s, hidden for 3s) with 10-minute weather synchronization.
+  - **Instant Switching**: Seamlessly toggle between Eco and Performance modes with a single tap on the status bar.
 - **Dual Layouts**: Supports **Portrait** (758x1024, default) and **Landscape** (1024x758, rotated 90 degrees clockwise to fit the portrait framebuffer).
 - **Dual Languages**: Dynamically toggles between **Chinese** and **English** (dates, weekdays, weather descriptions, and buttons).
+- **Frontlight Control**: Toggle frontlight illumination directly from the touchscreen status bar.
 - **LCD Clock**: Renders a giant digital clock using custom chamfered 7-segment segment vectors (no external font files required).
-- **Heartbeat Colon**: The clock colon ":" blinks dynamically (shows for 7 seconds, disappears for 3 seconds of every 10-second cycle).
 - **Clean Grayscale Icons**: Renders minimalist vector weather icons on-the-fly.
+- **Credential Protection**: Reads credentials from `user_config.sh` or environment variables to avoid exposing API keys in `/proc` process cmdline.
 - **Fast Interactive Response**: Orientation and language switching takes less than a second using a local weather forecast cache.
 - **Auto-Exit**: Daemon terminates and restores the Kindle GUI immediately upon USB charging or connection to a PC.
-- **Author Signature**: Renders `" by Gu0 Qiang"` centered at the bottom of the status bar.
+- **Author Signature**: Renders `" by Guo Qiang"` centered at the bottom of the status bar.
 
 ---
 
@@ -52,7 +57,7 @@ weather-station/
 ├── menu.json          # KUAL launcher menu
 ├── weather.sh         # Main automation loop & power daemon (shell script)
 ├── render.py          # Python Pillow layout rendering script
-├── monitor_touch.py   # Touchscreen input binary decoder daemon
+├── monitor_touch.py   # Touchscreen input binary decoder utility
 └── images/            # Screenshots and project media
 ```
 
@@ -61,12 +66,13 @@ weather-station/
 ## Installation & Configuration
 
 1. **OpenWeatherMap API Key**: Sign up at [OpenWeatherMap](https://openweathermap.org/) to get a free API key.
-2. **Configure weather.sh**:
-   Open `weather.sh` and fill in your details:
+2. **Configure Private Parameters** (Recommended: create `user_config.sh` to isolate your credentials):
+   Create or edit `user_config.sh`:
    ```bash
    API_KEY="YOUR_OPENWEATHERMAP_API_KEY"
    CITY_NAME="Shanghai,CN"
-   INTERVAL=600  # Wake up and update every 10 minutes (600 seconds)
+   POWER_MODE="eco"       # "eco" (Power-saving, default) or "perf" (Performance)
+   INTERVAL=1800          # Weather update interval in seconds (1800 for eco, 600 for perf)
    ```
 3. **Deploy to Kindle**:
    - Connect your Kindle to your PC via USB.
@@ -82,10 +88,15 @@ weather-station/
 2. Open **KUAL** on the device.
 3. Tap **Weather Station** -> **Start Weather Station**.
 4. The dashboard will launch and update automatically.
-5. Tap **中/EN** to switch between languages, **Rotate** / **旋转** to change the orientation, or **Exit** / **退出** to quit the dashboard and return to the Kindle home screen.
+5. The status bar provides 5 interactive touch buttons:
+   - **Rotate / 旋转**: Toggle orientation between portrait and landscape.
+   - **Eco / Perf (节能 / 性能)**: Switch between battery-saving 1-minute aligned mode and heartbeat animation mode.
+   - **Light / Dark (灯:开 / 灯:关)**: Toggle frontlight on or off.
+   - **中/EN**: Switch between English and Chinese typography.
+   - **Exit / 退出**: Gracefully terminate the dashboard and restore the Kindle e-reader GUI.
 
 ---
 
 ## License
 
-This project is open-source and free to use. Customized by **Gu0 Qiang**.
+This project is open-source and free to use. Customized by **Guo Qiang**.

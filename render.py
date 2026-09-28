@@ -57,8 +57,9 @@ if not os.path.exists("/tmp"):
 	CACHE_PATH = os.path.join(EXT_DIR, "weather_forecast.json")
 
 STOP_FILE = "/mnt/us/stop-weather"
-WEATHER_INTERVAL = 600  # 10 minutes between API fetches
-CACHE_TTL = 300         # 5 minutes cache validity
+WEATHER_INTERVAL_PERF = 600   # 10 minutes between API fetches in performance mode
+WEATHER_INTERVAL_ECO = 1800   # 30 minutes between API fetches in eco mode
+CACHE_TTL = 300               # 5 minutes cache validity
 
 # Weather description mappings
 DESC_MAP_ZH = {
@@ -552,18 +553,83 @@ def draw_button(draw, x1, y1, x2, y2, label, font):
 # ------------------------------------------------------------------------------
 # API FETCHING
 # ------------------------------------------------------------------------------
+def get_ssl_context():
+	"""
+	Construct a secure SSLContext that validates server certificates.
+	Falls back gracefully if the embedded device lacks system CA certificates.
+	"""
+	import ssl
+	try:
+		context = ssl.create_default_context()
+		ca_paths = [
+			"/etc/ssl/certs/ca-certificates.crt",
+			"/var/local/system/cacert.pem",
+			"/etc/pki/tls/certs/ca-bundle.crt",
+			"/etc/ssl/cert.pem",
+			os.path.join(EXT_DIR, "cacert.pem")
+		]
+		for ca_path in ca_paths:
+			if os.path.exists(ca_path):
+				try:
+					context.load_verify_locations(cafile=ca_path)
+					return context
+				except Exception:
+					pass
+		return context
+	except Exception as e:
+		print("Warning: Secure default SSL context creation failed: {0}".format(e))
+
+	# Fallback only if modern SSL context is unsupported on legacy Kindle Python
+	try:
+		if hasattr(ssl, "_create_unverified_context"):
+			print("WARNING: Falling back to unverified SSL context due to legacy system limitations.")
+			return ssl._create_unverified_context()
+	except Exception:
+		pass
+	return None
+
 def fetch_forecast(api_key, city):
 	encoded_city = urllib_parse.quote(city)
 	url = "https://api.openweathermap.org/data/2.5/forecast?q={0}&units=metric&appid={1}".format(encoded_city, api_key)
 
-	import ssl
-	try:
-		context = ssl._create_unverified_context()
-		response = urllib2.urlopen(url, timeout=15, context=context)
-	except AttributeError:
+	ctx = get_ssl_context()
+	if ctx is not None:
+		response = urllib2.urlopen(url, timeout=15, context=ctx)
+	else:
 		response = urllib2.urlopen(url, timeout=15)
 
 	return json.loads(response.read().decode('utf-8'))
+
+def render_error_screen(title, message, detail=""):
+	"""Render a clean error diagnostic screen on the Kindle display."""
+	image = Image.new("L", (758, 1024), 255)
+	draw = ImageDraw.Draw(image)
+
+	font_title = FONT_CHINESE(36)
+	font_msg = FONT_CHINESE(22)
+	font_detail = FONT_SANS(16)
+
+	draw.rectangle([40, 200, 718, 700], outline=0, width=3)
+	draw_centered_text(draw, 379, 240, title, font_title)
+	draw.line([(60, 310), (698, 310)], fill=0, width=1)
+
+	draw_centered_text(draw, 379, 360, message, font_msg)
+	if detail:
+		draw_centered_text(draw, 379, 420, detail, font_detail)
+
+	draw_centered_text(draw, 379, 560, "请检查配置或网络后重试", font_msg)
+	draw_centered_text(draw, 379, 620, "Check Wi-Fi & API config in user_config.sh", font_detail)
+
+	temp_path = OUTPUT_PATH + ".tmp"
+	image.save(temp_path, "PNG")
+	if os.path.exists(temp_path):
+		try:
+			os.replace(temp_path, OUTPUT_PATH)
+		except AttributeError:
+			if os.path.exists(OUTPUT_PATH):
+				os.remove(OUTPUT_PATH)
+			os.rename(temp_path, OUTPUT_PATH)
+	display_image(OUTPUT_PATH)
 
 def load_or_fetch_weather(api_key, city):
 	"""Load weather from cache or fetch from API. Manages WiFi automatically."""
@@ -613,110 +679,136 @@ def load_or_fetch_weather(api_key, city):
 	return data, False
 
 # ------------------------------------------------------------------------------
-# TOUCH EVENT MONITORING (merged from monitor_touch.py)
+# TOUCH EVENT MONITORING (Persistent Device Handle & 5 Button Zones)
 # ------------------------------------------------------------------------------
-def monitor_touch(dev_path, timeout_sec, orientation):
+class TouchMonitor(object):
 	"""
-	Monitor touchscreen for events within timeout.
-	Returns: "TOGGLE", "LIGHT", "LANG", "EXIT", or "NONE" (timeout)
+	Maintains a persistent touchscreen device file descriptor to eliminate
+	repeated open/close latency and avoid dropping touch events.
 	"""
-	try:
-		f = open(dev_path, "rb")
-	except Exception:
-		time.sleep(timeout_sec)
-		return "NONE"
+	def __init__(self, dev_path):
+		self.dev_path = dev_path
+		self.fp = None
+		if dev_path and os.path.exists(dev_path):
+			try:
+				self.fp = open(dev_path, "rb")
+			except Exception as e:
+				print("Error opening touchscreen device {0}: {1}".format(dev_path, e))
+				self.fp = None
 
-	event_format = "2iHHi"
-	event_size = struct.calcsize(event_format)
+	def read_action(self, timeout_sec, orientation):
+		"""
+		Monitor touchscreen for events within timeout.
+		Returns: "TOGGLE", "MODE", "LIGHT", "LANG", "EXIT", or "NONE" (timeout)
+		"""
+		if not self.fp:
+			time.sleep(timeout_sec)
+			return "NONE"
 
-	x = None
-	y = None
-	touch_x = None
-	touch_y = None
+		event_format = "2iHHi"
+		event_size = struct.calcsize(event_format)
 
-	start_time = time.time()
+		x = None
+		y = None
+		touch_x = None
+		touch_y = None
 
-	while True:
-		elapsed = time.time() - start_time
-		if elapsed >= timeout_sec:
-			break
+		start_time = time.time()
 
-		r, _, _ = select.select([f], [], [], timeout_sec - elapsed)
-		if not r:
-			break
-
-		data = f.read(event_size)
-		if len(data) < event_size:
-			break
-
-		_, _, ev_type, ev_code, ev_val = struct.unpack(event_format, data)
-
-		if ev_type == 3:  # EV_ABS
-			if ev_code in [0, 53]:  # ABS_X or ABS_MT_POSITION_X
-				x = ev_val
-			elif ev_code in [1, 54]:  # ABS_Y or ABS_MT_POSITION_Y
-				y = ev_val
-		elif ev_type == 1 and ev_code == 330:  # BTN_TOUCH release
-			if ev_val == 0 and x is not None and y is not None:
-				touch_x = x
-				touch_y = y
+		while True:
+			elapsed = time.time() - start_time
+			if elapsed >= timeout_sec:
 				break
-		elif ev_type == 0 and ev_code == 0:  # EV_SYN
-			if x is not None and y is not None:
-				touch_x = x
-				touch_y = y
 
-	f.close()
+			r, _, _ = select.select([self.fp], [], [], max(0.0, timeout_sec - elapsed))
+			if not r:
+				break
 
-	if touch_x is None or touch_y is None:
-		touch_x = x
-		touch_y = y
+			try:
+				data = self.fp.read(event_size)
+			except Exception:
+				break
 
-	if touch_x is None or touch_y is None:
+			if not data or len(data) < event_size:
+				break
+
+			_, _, ev_type, ev_code, ev_val = struct.unpack(event_format, data)
+
+			if ev_type == 3:  # EV_ABS
+				if ev_code in [0, 53]:  # ABS_X or ABS_MT_POSITION_X
+					x = ev_val
+				elif ev_code in [1, 54]:  # ABS_Y or ABS_MT_POSITION_Y
+					y = ev_val
+			elif ev_type == 1 and ev_code == 330:  # BTN_TOUCH release
+				if ev_val == 0 and x is not None and y is not None:
+					touch_x = x
+					touch_y = y
+					break
+			elif ev_type == 0 and ev_code == 0:  # EV_SYN
+				if x is not None and y is not None:
+					touch_x = x
+					touch_y = y
+
+		if touch_x is None or touch_y is None:
+			touch_x = x
+			touch_y = y
+
+		if touch_x is None or touch_y is None:
+			return "NONE"
+
+		# Scale coordinates to portrait space (758x1024)
+		if touch_x > 2000 or touch_y > 2000:
+			touch_x = int(touch_x * 758 / 4096)
+			touch_y = int(touch_y * 1024 / 4096)
+		elif touch_x > 1024 or touch_y > 1024:
+			touch_x = int(touch_x * 758 / 1024)
+			touch_y = int(touch_y * 1024 / 1280)
+
+		print("Touch: Scaled portrait=({0},{1}) orientation={2}".format(touch_x, touch_y, orientation))
+
+		# Detect 5 button zones: [Rotate] [Mode] [Light] [Lang] [Exit]
+		if orientation == "landscape":
+			# Bottom of landscape (ly > 710) maps to left of portrait (touch_x < 120)
+			# Landscape X coordinates map to portrait touch_y
+			if touch_x < 120:
+				if 640 <= touch_y < 715:
+					return "TOGGLE"
+				elif 715 <= touch_y < 785:
+					return "MODE"
+				elif 785 <= touch_y < 855:
+					return "LIGHT"
+				elif 855 <= touch_y < 925:
+					return "LANG"
+				elif touch_y >= 925:
+					return "EXIT"
+		else:
+			# Portrait: 5 buttons at bottom (y > 950)
+			if touch_y > 950:
+				if 440 <= touch_x < 500:
+					return "TOGGLE"
+				elif 500 <= touch_x < 560:
+					return "MODE"
+				elif 560 <= touch_x < 620:
+					return "LIGHT"
+				elif 620 <= touch_x < 680:
+					return "LANG"
+				elif touch_x >= 680:
+					return "EXIT"
+
 		return "NONE"
 
-	# Scale coordinates to portrait space (758x1024)
-	if touch_x > 2000 or touch_y > 2000:
-		touch_x = int(touch_x * 758 / 4096)
-		touch_y = int(touch_y * 1024 / 4096)
-	elif touch_x > 1024 or touch_y > 1024:
-		touch_x = int(touch_x * 758 / 1024)
-		touch_y = int(touch_y * 1024 / 1280)
-
-	print("Touch: Raw scaled portrait=({0},{1}) orientation={2}".format(touch_x, touch_y, orientation))
-
-	# Detect button zones
-	if orientation == "landscape":
-		# After ROTATE_270: landscape point (lx, ly) -> portrait (757-ly, lx)
-		# Buttons are at bottom of landscape (ly > 710), so portrait touch_x < ~50
-		# Button X ranges map to portrait touch_y
-		if touch_x < 120:
-			if 675 <= touch_y < 750:
-				return "TOGGLE"
-			elif 750 <= touch_y < 825:
-				return "LIGHT"
-			elif 825 <= touch_y < 900:
-				return "LANG"
-			elif touch_y >= 900:
-				return "EXIT"
-	else:
-		# Portrait: buttons at bottom (y > 950)
-		if touch_y > 950:
-			if 458 <= touch_x < 535:
-				return "TOGGLE"
-			elif 535 <= touch_x < 612:
-				return "LIGHT"
-			elif 612 <= touch_x < 690:
-				return "LANG"
-			elif touch_x >= 690:
-				return "EXIT"
-
-	return "NONE"
+	def close(self):
+		if self.fp:
+			try:
+				self.fp.close()
+			except Exception:
+				pass
+			self.fp = None
 
 # ------------------------------------------------------------------------------
 # DASHBOARD RENDERING
 # ------------------------------------------------------------------------------
-def render_dashboard(data, orientation, lang, battery_level, light_on, show_colon=True):
+def render_dashboard(data, orientation, lang, battery_level, light_on, power_mode="eco", show_colon=True):
 	"""Render the complete weather dashboard and save to OUTPUT_PATH."""
 	# Extract weather data
 	timezone_offset = data["city"]["timezone"]
@@ -746,6 +838,7 @@ def render_dashboard(data, orientation, lang, battery_level, light_on, show_colo
 		day_of_week = days[now.weekday()]
 		week_str = "Week {0}".format(week_num)
 		btn_rotate_lbl = "Rotate"
+		btn_mode_lbl = "Eco" if power_mode == "eco" else "Perf"
 		btn_light_lbl = "Light" if not light_on else "Dark"
 		btn_lang_lbl = "中/EN"
 		btn_exit_lbl = "Exit"
@@ -755,6 +848,7 @@ def render_dashboard(data, orientation, lang, battery_level, light_on, show_colo
 		day_of_week = days[now.weekday()]
 		week_str = "第{0}周".format(week_num)
 		btn_rotate_lbl = "旋转"
+		btn_mode_lbl = "节能" if power_mode == "eco" else "性能"
 		btn_light_lbl = "灯:关" if not light_on else "灯:开"
 		btn_lang_lbl = "中/EN"
 		btn_exit_lbl = "退出"
@@ -766,9 +860,10 @@ def render_dashboard(data, orientation, lang, battery_level, light_on, show_colo
 			time_str=time_str, show_colon=show_colon, sunrise_str=sunrise_str,
 			sunset_str=sunset_str, week_str=week_str, day_of_week=day_of_week,
 			battery_level=battery_level, light_on=light_on, lang=lang,
-			timezone_offset=timezone_offset,
-			btn_rotate_lbl=btn_rotate_lbl, btn_light_lbl=btn_light_lbl,
-			btn_lang_lbl=btn_lang_lbl, btn_exit_lbl=btn_exit_lbl,
+			power_mode=power_mode, timezone_offset=timezone_offset,
+			btn_rotate_lbl=btn_rotate_lbl, btn_mode_lbl=btn_mode_lbl,
+			btn_light_lbl=btn_light_lbl, btn_lang_lbl=btn_lang_lbl,
+			btn_exit_lbl=btn_exit_lbl,
 		)
 	else:
 		image = _render_portrait(
@@ -777,18 +872,27 @@ def render_dashboard(data, orientation, lang, battery_level, light_on, show_colo
 			time_str=time_str, show_colon=show_colon, sunrise_str=sunrise_str,
 			sunset_str=sunset_str, week_str=week_str, day_of_week=day_of_week,
 			battery_level=battery_level, light_on=light_on, lang=lang,
-			timezone_offset=timezone_offset,
-			btn_rotate_lbl=btn_rotate_lbl, btn_light_lbl=btn_light_lbl,
-			btn_lang_lbl=btn_lang_lbl, btn_exit_lbl=btn_exit_lbl,
+			power_mode=power_mode, timezone_offset=timezone_offset,
+			btn_rotate_lbl=btn_rotate_lbl, btn_mode_lbl=btn_mode_lbl,
+			btn_light_lbl=btn_light_lbl, btn_lang_lbl=btn_lang_lbl,
+			btn_exit_lbl=btn_exit_lbl,
 		)
 
-	image.save(OUTPUT_PATH, "PNG")
+	temp_path = OUTPUT_PATH + ".tmp"
+	image.save(temp_path, "PNG")
+	if os.path.exists(temp_path):
+		try:
+			os.replace(temp_path, OUTPUT_PATH)
+		except AttributeError:
+			if os.path.exists(OUTPUT_PATH):
+				os.remove(OUTPUT_PATH)
+			os.rename(temp_path, OUTPUT_PATH)
 
 def _render_portrait(data, desc_text, current_temp, current_state, city_name,
                      date_str, time_str, show_colon, sunrise_str, sunset_str,
                      week_str, day_of_week, battery_level, light_on, lang,
-                     timezone_offset, btn_rotate_lbl, btn_light_lbl,
-                     btn_lang_lbl, btn_exit_lbl, draw_params=None):
+                     power_mode, timezone_offset, btn_rotate_lbl, btn_mode_lbl,
+                     btn_light_lbl, btn_lang_lbl, btn_exit_lbl, draw_params=None):
 	"""Render portrait layout (758x1024)."""
 	image = Image.new("L", (758, 1024), 255)
 	draw = ImageDraw.Draw(image)
@@ -800,7 +904,7 @@ def _render_portrait(data, desc_text, current_temp, current_state, city_name,
 	else:
 		desc_font = FONT_CHINESE(48)
 		status_font = FONT_CHINESE(20)
-		btn_font = FONT_CHINESE(16)
+		btn_font = FONT_CHINESE(15)
 
 	# === SECTION 1: TOP SECTION (Y = 0 to 220) ===
 	draw_weather_icon(draw, (110, 110), 140, current_state)
@@ -860,32 +964,33 @@ def _render_portrait(data, desc_text, current_temp, current_state, city_name,
 	# Left side: info text
 	info_y = 964
 	draw.text((15, info_y), week_str, font=status_font, fill=0)
-	draw.text((100, info_y), day_of_week, font=status_font, fill=0)
-	draw_sunrise_graphic(draw, (215, info_y + 13), 24)
-	draw.text((233, info_y), sunrise_str, font=FONT_SANS(18), fill=0)
-	draw_sunset_graphic(draw, (310, info_y + 13), 24)
-	draw.text((328, info_y), sunset_str, font=FONT_SANS(18), fill=0)
+	draw.text((88, info_y), day_of_week, font=status_font, fill=0)
+	draw_sunrise_graphic(draw, (185, info_y + 13), 22)
+	draw.text((200, info_y), sunrise_str, font=FONT_SANS(16), fill=0)
+	draw_sunset_graphic(draw, (260, info_y + 13), 22)
+	draw.text((275, info_y), sunset_str, font=FONT_SANS(16), fill=0)
 
 	# Battery icon + percentage
-	batt_x = 395
+	batt_x = 340
 	if battery_level >= 0:
-		draw_battery_icon(draw, batt_x, info_y + 2, battery_level, size=16)
-		draw.text((batt_x + 38, info_y), "{0}%".format(battery_level), font=FONT_SANS(16), fill=0)
+		draw_battery_icon(draw, batt_x, info_y + 2, battery_level, size=15)
+		draw.text((batt_x + 34, info_y), "{0}%".format(battery_level), font=FONT_SANS(15), fill=0)
 
-	# Right side: 4 buttons
+	# Right side: 5 buttons [Rotate] [Mode] [Light] [Lang] [Exit]
 	btn_y1 = 957
 	btn_y2 = 993
-	btn_w = 63
-	btn_gap = 8
-	btn_start = 468
+	btn_w = 54
+	btn_gap = 6
+	btn_start = 445
 
 	draw_button(draw, btn_start, btn_y1, btn_start + btn_w, btn_y2, btn_rotate_lbl, btn_font)
-	draw_button(draw, btn_start + btn_w + btn_gap, btn_y1, btn_start + 2*btn_w + btn_gap, btn_y2, btn_light_lbl, btn_font)
-	draw_button(draw, btn_start + 2*(btn_w + btn_gap), btn_y1, btn_start + 3*btn_w + 2*btn_gap, btn_y2, btn_lang_lbl, btn_font)
-	draw_button(draw, btn_start + 3*(btn_w + btn_gap), btn_y1, btn_start + 4*btn_w + 3*btn_gap, btn_y2, btn_exit_lbl, btn_font)
+	draw_button(draw, btn_start + btn_w + btn_gap, btn_y1, btn_start + 2*btn_w + btn_gap, btn_y2, btn_mode_lbl, btn_font)
+	draw_button(draw, btn_start + 2*(btn_w + btn_gap), btn_y1, btn_start + 3*btn_w + 2*btn_gap, btn_y2, btn_light_lbl, btn_font)
+	draw_button(draw, btn_start + 3*(btn_w + btn_gap), btn_y1, btn_start + 4*btn_w + 3*btn_gap, btn_y2, btn_lang_lbl, btn_font)
+	draw_button(draw, btn_start + 4*(btn_w + btn_gap), btn_y1, btn_start + 5*btn_w + 4*btn_gap, btn_y2, btn_exit_lbl, btn_font)
 
 	# Author Signature
-	signature = " by Gu0 Qiang"
+	signature = " by Guo Qiang"
 	draw_centered_text(draw, 758 // 2, 1006, signature, FONT_SANS(12))
 
 	return image
@@ -893,8 +998,8 @@ def _render_portrait(data, desc_text, current_temp, current_state, city_name,
 def _render_landscape(data, desc_text, current_temp, current_state, city_name,
                       date_str, time_str, show_colon, sunrise_str, sunset_str,
                       week_str, day_of_week, battery_level, light_on, lang,
-                      timezone_offset, btn_rotate_lbl, btn_light_lbl,
-                      btn_lang_lbl, btn_exit_lbl, draw_params=None):
+                      power_mode, timezone_offset, btn_rotate_lbl, btn_mode_lbl,
+                      btn_light_lbl, btn_lang_lbl, btn_exit_lbl, draw_params=None):
 	"""Render landscape layout (1024x758), then rotate for framebuffer."""
 	image = Image.new("L", (1024, 758), 255)
 	draw = ImageDraw.Draw(image)
@@ -906,7 +1011,7 @@ def _render_landscape(data, desc_text, current_temp, current_state, city_name,
 	else:
 		desc_font = FONT_CHINESE(48)
 		status_font = FONT_CHINESE(20)
-		btn_font = FONT_CHINESE(16)
+		btn_font = FONT_CHINESE(15)
 
 	# === SECTION 1: TOP SECTION (Y = 0 to 220) ===
 	draw_weather_icon(draw, (120, 110), 140, current_state)
@@ -964,33 +1069,34 @@ def _render_landscape(data, desc_text, current_temp, current_state, city_name,
 
 	# === STATUS BAR (Y = 710 to 758) ===
 	info_y = 722
-	draw.text((30, info_y), week_str, font=status_font, fill=0)
-	draw_sunrise_graphic(draw, (150, info_y + 13), 24)
-	draw.text((168, info_y), sunrise_str, font=FONT_SANS(18), fill=0)
-	draw_sunset_graphic(draw, (280, info_y + 13), 24)
-	draw.text((298, info_y), sunset_str, font=FONT_SANS(18), fill=0)
-	draw.text((380, info_y), day_of_week, font=status_font, fill=0)
+	draw.text((25, info_y), week_str, font=status_font, fill=0)
+	draw_sunrise_graphic(draw, (135, info_y + 13), 22)
+	draw.text((150, info_y), sunrise_str, font=FONT_SANS(16), fill=0)
+	draw_sunset_graphic(draw, (245, info_y + 13), 22)
+	draw.text((260, info_y), sunset_str, font=FONT_SANS(16), fill=0)
+	draw.text((335, info_y), day_of_week, font=status_font, fill=0)
 
 	# Battery icon + percentage
-	batt_x = 510
+	batt_x = 460
 	if battery_level >= 0:
 		draw_battery_icon(draw, batt_x, info_y + 2, battery_level, size=16)
-		draw.text((batt_x + 38, info_y), "{0}%".format(battery_level), font=FONT_SANS(16), fill=0)
+		draw.text((batt_x + 36, info_y), "{0}%".format(battery_level), font=FONT_SANS(16), fill=0)
 
-	# 4 buttons (right side)
+	# 5 buttons (right side) [Rotate] [Mode] [Light] [Lang] [Exit]
 	btn_y1 = 716
 	btn_y2 = 752
-	btn_w = 65
+	btn_w = 62
 	btn_gap = 8
-	btn_start = 680
+	btn_start = 650
 
 	draw_button(draw, btn_start, btn_y1, btn_start + btn_w, btn_y2, btn_rotate_lbl, btn_font)
-	draw_button(draw, btn_start + btn_w + btn_gap, btn_y1, btn_start + 2*btn_w + btn_gap, btn_y2, btn_light_lbl, btn_font)
-	draw_button(draw, btn_start + 2*(btn_w + btn_gap), btn_y1, btn_start + 3*btn_w + 2*btn_gap, btn_y2, btn_lang_lbl, btn_font)
-	draw_button(draw, btn_start + 3*(btn_w + btn_gap), btn_y1, btn_start + 4*btn_w + 3*btn_gap, btn_y2, btn_exit_lbl, btn_font)
+	draw_button(draw, btn_start + btn_w + btn_gap, btn_y1, btn_start + 2*btn_w + btn_gap, btn_y2, btn_mode_lbl, btn_font)
+	draw_button(draw, btn_start + 2*(btn_w + btn_gap), btn_y1, btn_start + 3*btn_w + 2*btn_gap, btn_y2, btn_light_lbl, btn_font)
+	draw_button(draw, btn_start + 3*(btn_w + btn_gap), btn_y1, btn_start + 4*btn_w + 3*btn_gap, btn_y2, btn_lang_lbl, btn_font)
+	draw_button(draw, btn_start + 4*(btn_w + btn_gap), btn_y1, btn_start + 5*btn_w + 4*btn_gap, btn_y2, btn_exit_lbl, btn_font)
 
 	# Author Signature
-	signature = " by Gu0 Qiang"
+	signature = " by Guo Qiang"
 	draw_centered_text(draw, 1024 // 2, 742, signature, FONT_SANS(12))
 
 	# Rotate 90° clockwise for portrait framebuffer
@@ -1002,13 +1108,6 @@ def _render_landscape(data, desc_text, current_temp, current_state, city_name,
 # MAIN LOOP (Persistent Process)
 # ------------------------------------------------------------------------------
 def main():
-	if len(sys.argv) < 3:
-		print("Usage: render.py <API_KEY> <CITY_NAME>")
-		sys.exit(1)
-
-	api_key = sys.argv[1]
-	city_query = sys.argv[2]
-
 	# Signal handler for clean shutdown
 	running = [True]
 	def handle_signal(sig, frame):
@@ -1017,17 +1116,45 @@ def main():
 	signal.signal(signal.SIGINT, handle_signal)
 	signal.signal(signal.SIGTERM, handle_signal)
 
-	# Find touchscreen device
-	touch_dev = find_touchscreen()
-	if touch_dev:
-		print("Touchscreen found: {0}".format(touch_dev))
-	else:
-		print("No touchscreen found. Touch features disabled.")
+	# Read credentials securely from environment variables first (avoids /proc cmdline exposure)
+	api_key = os.environ.get("OPENWEATHER_API_KEY")
+	city_query = os.environ.get("OPENWEATHER_CITY")
+
+	# Fallback to sys.argv for backward compatibility
+	if not api_key and len(sys.argv) > 1:
+		api_key = sys.argv[1]
+	if not city_query and len(sys.argv) > 2:
+		city_query = sys.argv[2]
+
+	# Fallback to reading user_config.sh directly if not found
+	if not api_key or api_key == "YOUR_OPENWEATHERMAP_API_KEY":
+		for cfg_path in [os.path.join(EXT_DIR, "user_config.sh"), "./user_config.sh"]:
+			if os.path.exists(cfg_path):
+				try:
+					with open(cfg_path, "r") as f:
+						for line in f:
+							line = line.strip()
+							if line.startswith("API_KEY="):
+								api_key = line.split("=", 1)[1].strip('"\'')
+							elif line.startswith("CITY_NAME="):
+								city_query = line.split("=", 1)[1].strip('"\'')
+				except Exception:
+					pass
+
+	if not city_query:
+		city_query = "Shanghai,CN"
+
+	if not api_key or api_key == "YOUR_OPENWEATHERMAP_API_KEY":
+		print("FATAL: No valid OpenWeatherMap API Key found.")
+		render_error_screen("请配置 API KEY", "缺少有效的天气 API Key", "Edit user_config.sh to set your API_KEY.")
+		sys.exit(1)
 
 	# Initial weather data load
 	data, _ = load_or_fetch_weather(api_key, city_query)
 	if data is None:
 		print("FATAL: No weather data available.")
+		render_error_screen("天气数据加载失败", "无法获取 OpenWeatherMap 预报数据", "Please check Wi-Fi connection and API key.")
+		time.sleep(10)
 		sys.exit(1)
 
 	last_fetch_time = time.time()
@@ -1035,62 +1162,87 @@ def main():
 	# Read initial states
 	orientation = read_state("orientation", "portrait")
 	lang = read_state("language", "zh")
+	power_mode = read_state("mode", os.environ.get("WEATHER_POWER_MODE", "eco")).lower()
+	if power_mode not in ("eco", "perf"):
+		power_mode = "eco"
 
-	print("Dashboard persistent process started. Orientation={0}, Lang={1}".format(orientation, lang))
+	# Initialize persistent touch monitor
+	touch_dev = find_touchscreen()
+	touch_monitor = TouchMonitor(touch_dev)
+	if touch_monitor.fp:
+		print("Touchscreen initialized: {0}".format(touch_dev))
+	else:
+		print("No touchscreen found. Touch features disabled.")
 
-	while running[0]:
-		# --- Exit condition checks ---
-		if is_usb_connected() or check_stop_files():
-			print("USB connection or stop flag detected. Exiting.")
-			break
+	print("Dashboard persistent process started. Orientation={0}, Lang={1}, PowerMode={2}".format(
+		orientation, lang, power_mode))
 
-		# --- Weather refresh check (every 10 minutes) ---
-		if time.time() - last_fetch_time > WEATHER_INTERVAL:
-			print("Refreshing weather data...")
-			new_data, _ = load_or_fetch_weather(api_key, city_query)
-			if new_data is not None:
-				data = new_data
-			last_fetch_time = time.time()
+	try:
+		while running[0]:
+			# --- Exit condition checks ---
+			if is_usb_connected() or check_stop_files():
+				print("USB connection or stop flag detected. Exiting.")
+				break
 
-		# --- Read system state ---
-		battery_level = get_battery_level()
-		light_level = get_light_level()
-		light_on = light_level > 0
+			# --- Weather refresh check ---
+			current_weather_interval = WEATHER_INTERVAL_ECO if power_mode == "eco" else WEATHER_INTERVAL_PERF
+			now_hour = datetime.datetime.now().hour
+			if power_mode == "eco" and (0 <= now_hour < 6):
+				# Night mode (00:00 - 06:00): 1 hour interval
+				current_weather_interval = 3600
 
-		# --- Calculate colon blink state ---
-		sec = datetime.datetime.now().second
-		sec_mod = sec % 10
-		show_colon = sec_mod < 7
+			if time.time() - last_fetch_time > current_weather_interval:
+				print("Refreshing weather data (Mode: {0}, Interval: {1}s)...".format(power_mode, current_weather_interval))
+				new_data, _ = load_or_fetch_weather(api_key, city_query)
+				if new_data is not None:
+					data = new_data
+				last_fetch_time = time.time()
 
-		# --- Render & Display ---
-		render_dashboard(data, orientation, lang, battery_level, light_on, show_colon)
-		display_image(OUTPUT_PATH)
+			# --- Read system state ---
+			battery_level = get_battery_level()
+			light_level = get_light_level()
+			light_on = light_level > 0
 
-		# --- Calculate timeout until next colon state change ---
-		sec = datetime.datetime.now().second
-		sec_mod = sec % 10
-		if sec_mod < 7:
-			next_timeout = 7 - sec_mod
-		else:
-			next_timeout = 10 - sec_mod
-		if next_timeout <= 0:
-			next_timeout = 1
+			# --- Calculate colon state and loop timeout ---
+			now = datetime.datetime.now()
+			if power_mode == "eco":
+				show_colon = True
+				# Align with minute boundary (60 - current second)
+				next_timeout = 60 - now.second
+				if next_timeout <= 0:
+					next_timeout = 60
+			else:
+				sec = now.second
+				sec_mod = sec % 10
+				show_colon = sec_mod < 7
+				if sec_mod < 7:
+					next_timeout = 7 - sec_mod
+				else:
+					next_timeout = 10 - sec_mod
+				if next_timeout <= 0:
+					next_timeout = 1
 
-		# --- Monitor touch events ---
-		if touch_dev:
-			action = monitor_touch(touch_dev, next_timeout, orientation)
+			# --- Render & Display ---
+			render_dashboard(data, orientation, lang, battery_level, light_on, power_mode, show_colon)
+			display_image(OUTPUT_PATH)
+
+			# --- Monitor touch events ---
+			action = touch_monitor.read_action(next_timeout, orientation)
 
 			if action == "TOGGLE":
 				print("Action: Toggling orientation.")
 				orientation = "landscape" if orientation == "portrait" else "portrait"
 				write_state("orientation", orientation)
-				# Immediate re-render will happen at top of loop
+
+			elif action == "MODE":
+				power_mode = "perf" if power_mode == "eco" else "eco"
+				print("Action: Toggled power mode to: {0}".format(power_mode))
+				write_state("mode", power_mode)
+				continue
 
 			elif action == "LIGHT":
 				print("Action: Toggling frontlight.")
 				toggle_light()
-				# Light change is instant, no re-render needed for just the light
-				# But we re-render to update button label
 				continue
 
 			elif action == "LANG":
@@ -1102,9 +1254,9 @@ def main():
 				print("Action: User requested exit.")
 				break
 
-			# "NONE" = timeout, just loop and re-render (colon blink update)
-		else:
-			time.sleep(next_timeout)
+			# "NONE" = timeout, loops to re-render
+	finally:
+		touch_monitor.close()
 
 	print("Dashboard persistent process exiting.")
 	sys.exit(0)

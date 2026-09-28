@@ -6,20 +6,6 @@
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# USER CONFIGURATION (Defaults)
-# ------------------------------------------------------------------------------
-API_KEY="YOUR_OPENWEATHERMAP_API_KEY"
-CITY_NAME="Shanghai,CN"
-INTERVAL=600  # Wake up every 10 minutes (600 seconds)
-
-# Load local private configuration if it exists
-if [ -f "$EXT_DIR/user_config.sh" ]; then
-	. "$EXT_DIR/user_config.sh"
-elif [ -f "./user_config.sh" ]; then
-	. "./user_config.sh"
-fi
-
-# ------------------------------------------------------------------------------
 # PATHS AND PLACES
 # ------------------------------------------------------------------------------
 EXT_DIR="/mnt/us/extensions/weather-station"
@@ -30,6 +16,27 @@ LOG_FILE="$EXT_DIR/weather.log"
 PYTHON_SCRIPT="$EXT_DIR/render.py"
 OUTPUT_PNG="/tmp/output.png"
 [ -f "$OUTPUT_PNG" ] || OUTPUT_PNG="$EXT_DIR/output.png"
+
+# ------------------------------------------------------------------------------
+# USER CONFIGURATION (Defaults)
+# ------------------------------------------------------------------------------
+API_KEY="YOUR_OPENWEATHERMAP_API_KEY"
+CITY_NAME="Shanghai,CN"
+POWER_MODE="eco"  # "eco" (Power-saving, recommended) or "perf" (Performance)
+INTERVAL=1800     # Default weather API fetch interval in seconds (1800 for eco, 600 for perf)
+
+# Load local private configuration if it exists
+if [ -f "$EXT_DIR/user_config.sh" ]; then
+	. "$EXT_DIR/user_config.sh"
+elif [ -f "./user_config.sh" ]; then
+	. "./user_config.sh"
+fi
+
+# Securely export configuration to environment variables to avoid exposing API_KEY in /proc cmdline
+export OPENWEATHER_API_KEY="$API_KEY"
+export OPENWEATHER_CITY="$CITY_NAME"
+export WEATHER_POWER_MODE="$POWER_MODE"
+export WEATHER_INTERVAL="$INTERVAL"
 
 # ------------------------------------------------------------------------------
 # SYSTEM FUNCTIONS
@@ -121,8 +128,8 @@ cleanup() {
 case "$1" in
 	start)
 		if [ -f "$PIDFILE" ]; then
-			PID=$(cat "$PIDFILE")
-			if kill -0 "$PID" >/dev/null 2>&1; then
+			PID=$(cat "$PIDFILE" 2>/dev/null | tr -cd '0-9')
+			if [ -n "$PID" ] && kill -0 "$PID" >/dev/null 2>&1; then
 				echo "Weather Station is already running (PID: $PID)."
 				exit 0
 			fi
@@ -138,7 +145,7 @@ case "$1" in
 		sleep 2
 		
 		if [ -f "$PIDFILE" ]; then
-			echo "Weather Station started."
+			echo "Weather Station started (Mode: $POWER_MODE)."
 		else
 			echo "Failed to start Weather Station."
 		fi
@@ -149,8 +156,8 @@ case "$1" in
 		touch "$STOP_FILE"
 		touch "$EXT_DIR/stop"
 		if [ -f "$PIDFILE" ]; then
-			PID=$(cat "$PIDFILE")
-			if kill -0 "$PID" >/dev/null 2>&1; then
+			PID=$(cat "$PIDFILE" 2>/dev/null | tr -cd '0-9')
+			if [ -n "$PID" ] && kill -0 "$PID" >/dev/null 2>&1; then
 				kill "$PID"
 				sleep 2
 			fi
@@ -164,7 +171,7 @@ case "$1" in
 		echo "$$" > "$PIDFILE"
 		trap "cleanup; exit 0" SIGINT SIGTERM SIGHUP
 		
-		log "Weather Station daemon started."
+		log "Weather Station daemon started (Power Mode: $POWER_MODE)."
 
 		
 		# Halt native GUI
@@ -173,11 +180,10 @@ case "$1" in
 		clear_screen
 		
 		# Run the persistent Python process.
-		# Python handles: rendering, touch input, weather fetching, WiFi,
-		# USB detection, and colon blink timing internally.
+		# Credentials and mode are passed via environment variables (not argv).
 		log "Starting persistent Python dashboard process."
-		/mnt/us/python3/bin/python3.9 -u "$PYTHON_SCRIPT" "$API_KEY" "$CITY_NAME"
-		local python_exit=$?
+		/mnt/us/python3/bin/python3.9 -u "$PYTHON_SCRIPT"
+		python_exit=$?
 		log "Python process exited with code $python_exit."
 		
 		# Cleanup and restore Kindle GUI
